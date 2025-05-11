@@ -1,0 +1,315 @@
+<!DOCTYPE html>
+<html lang="fr">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+  <title>Gestion de Stock Sécurisée</title>
+
+  <!-- En-têtes de sécurité -->
+  <meta http-equiv="X-Content-Type-Options" content="nosniff" />
+  <meta http-equiv="X-XSS-Protection" content="1; mode=block" />
+  <meta http-equiv="Content-Security-Policy" content="
+    default-src 'self';
+    script-src 'self' 'unsafe-eval';
+    style-src 'self' 'unsafe-inline';
+    img-src 'self' data:;
+    font-src 'self';
+    connect-src 'self';
+    frame-src 'none';
+    object-src 'none';
+  " />
+
+  <!-- PWA -->
+  <link rel="manifest" href="manifest.json" />
+  <meta name="theme-color" content="#007bff">
+  <link rel="apple-touch-icon" href="icons/icon-512.png">
+  
+  <!-- Styles -->
+  <style>
+    body {
+      background: #f3f5f9;
+      color: #333;
+      font-family: Arial, sans-serif;
+      margin: 0;
+      padding: 20px;
+    }
+
+    input, button {
+      width: 100%;
+      padding: 10px;
+      margin: 5px 0;
+      box-sizing: border-box;
+    }
+
+    .notification {
+      position: fixed;
+      top: 20px;
+      right: 20px;
+      background: #007bff;
+      color: white;
+      padding: 10px 20px;
+      border-radius: 4px;
+      z-index: 1000;
+      display: none;
+    }
+
+    .notification.error {
+      background: #dc3545;
+    }
+  </style>
+</head>
+<body>
+  <div id="notification" class="notification"></div>
+
+  <!-- Configuration du mot de passe -->
+  <div id="setupScreen">
+    <h2>Configurer le mot de passe</h2>
+    <form onsubmit="setupPassword(event)">
+      <input type="password" id="newPassword" placeholder="Mot de passe (min 12 caractères, 1 chiffre, 1 spécial)" required />
+      <button type="submit">Valider</button>
+    </form>
+  </div>
+
+  <!-- Connexion -->
+  <div id="loginScreen" style="display:none;">
+    <h2>Connexion</h2>
+    <form onsubmit="login(event)">
+      <input type="password" id="password" placeholder="Entrez votre mot de passe" required />
+      <button type="submit">Se connecter</button>
+    </form>
+  </div>
+
+  <!-- Interface principale -->
+  <div id="appScreen" style="display:none;">
+    <h2>Gestion de Stock</h2>
+    <button onclick="lockApp()">Verrouiller</button>
+    <form onsubmit="addProduct(event)">
+      <input type="text" id="productName" placeholder="Nom du produit" required />
+      <input type="number" id="productQuantity" placeholder="Quantité" min="0" required />
+      <button type="submit">Ajouter Produit</button>
+    </form>
+    <ul id="productList"></ul>
+  </div>
+
+  <script>
+    const SECURITY_CONFIG = {
+      PASSWORD_POLICY: {
+        minLength: 12,
+        requireSpecialChar: true,
+        requireNumber: true,
+        maxAttempts: 5,
+        attemptDelay: 30000 // Délai après 5 tentatives
+      },
+      ENCRYPTION: {
+        iterations: 310000,
+        keyLength: 256
+      }
+    };
+
+    let products = [];
+    let encryptionKey = null;
+    let hmacKey = null;
+    let failedAttempts = 0;
+
+    function showNotification(message, isError = false) {
+      const el = document.getElementById("notification");
+      el.textContent = message;
+      el.className = "notification" + (isError ? " error" : "");
+      el.style.display = "block";
+      setTimeout(() => el.style.display = "none", 5000);
+    }
+
+    function sanitizeInput(input) {
+      return input.replace(/[<>"']/g, '');
+    }
+
+    async function deriveKeys(password, saltBuffer) {
+      const encoder = new TextEncoder();
+      const keyMaterial = await crypto.subtle.importKey(
+        "raw", encoder.encode(password), "PBKDF2", false, ["deriveKey"]
+      );
+
+      const aesKey = await crypto.subtle.deriveKey({
+        name: "PBKDF2",
+        salt: saltBuffer,
+        iterations: SECURITY_CONFIG.ENCRYPTION.iterations,
+        hash: "SHA-256"
+      }, keyMaterial, { name: "AES-GCM", length: SECURITY_CONFIG.ENCRYPTION.keyLength }, true, ["encrypt", "decrypt"]);
+
+      const hmacKey = await crypto.subtle.deriveKey({
+        name: "PBKDF2",
+        salt: saltBuffer.slice(-32),
+        iterations: SECURITY_CONFIG.ENCRYPTION.iterations,
+        hash: "SHA-256"
+      }, keyMaterial, { name: "HMAC", hash: "SHA-256" }, true, ["sign", "verify"]);
+
+      return { aesKey, hmacKey };
+    }
+
+    async function encrypt(data, aesKey, hmacKey) {
+      const iv = crypto.getRandomValues(new Uint8Array(12));
+      const encoded = new TextEncoder().encode(JSON.stringify(data));
+      const cipherText = await crypto.subtle.encrypt({ name: "AES-GCM", iv }, aesKey, encoded);
+      const hmac = await crypto.subtle.sign("HMAC", hmacKey, cipherText);
+
+      return {
+        cipher: btoa(String.fromCharCode(...new Uint8Array(cipherText))),
+        hmac: btoa(String.fromCharCode(...new Uint8Array(hmac))),
+        iv: btoa(String.fromCharCode(...iv))
+      };
+    }
+
+    async function decrypt(data, aesKey, hmacKey) {
+      const cipherText = Uint8Array.from(atob(data.cipher), c => c.charCodeAt(0)).buffer;
+      const storedHmac = Uint8Array.from(atob(data.hmac), c => c.charCodeAt(0));
+      const iv = Uint8Array.from(atob(data.iv), c => c.charCodeAt(0));
+
+      const computedHmac = await crypto.subtle.sign("HMAC", hmacKey, cipherText);
+      if (!constantTimeCompare(storedHmac, computedHmac)) {
+        throw new Error("Signature HMAC invalide");
+      }
+
+      const decrypted = await crypto.subtle.decrypt({ name: "AES-GCM", iv }, aesKey, cipherText);
+      return JSON.parse(new TextDecoder().decode(decrypted));
+    }
+
+    function constantTimeCompare(a, b) {
+      const A = new Uint8Array(a), B = new Uint8Array(b);
+      if (A.length !== B.length) return false;
+      let result = 0;
+      for (let i = 0; i < A.length; i++) result |= A[i] ^ B[i];
+      return result === 0;
+    }
+
+    async function setupPassword(e) {
+      e.preventDefault();
+      try {
+        const passwordInput = document.getElementById("newPassword");
+        const password = sanitizeInput(passwordInput.value);
+        passwordInput.value = '';
+        validatePassword(password);
+
+        const salt = crypto.getRandomValues(new Uint8Array(16));
+        const keys = await deriveKeys(password, salt.buffer);
+        localStorage.setItem("authData", JSON.stringify({
+          salt: btoa(String.fromCharCode(...salt)),
+          createdAt: new Date().toISOString()
+        }));
+
+        encryptionKey = keys.aesKey;
+        hmacKey = keys.hmacKey;
+        products = [];
+
+        document.getElementById("setupScreen").style.display = "none";
+        document.getElementById("appScreen").style.display = "block";
+
+        renderProducts();
+        saveToLocalStorage();
+
+      } catch (err) {
+        showNotification(err.message, true);
+      }
+    }
+
+    async function login(e) {
+      e.preventDefault();
+      const passwordInput = document.getElementById("password");
+      const password = sanitizeInput(passwordInput.value);
+      passwordInput.value = '';
+
+      const authData = localStorage.getItem("authData");
+      if (!authData) throw new Error("Aucun mot de passe défini");
+
+      const parsedAuth = JSON.parse(authData);
+      const saltBuffer = Uint8Array.from(atob(parsedAuth.salt), c => c.charCodeAt(0)).buffer;
+      const keys = await deriveKeys(password, saltBuffer);
+
+      const encryptedData = localStorage.getItem("secureData");
+      if (encryptedData) {
+        const decrypted = await decrypt(JSON.parse(encryptedData), keys.aesKey, keys.hmacKey);
+        products = decrypted.products || [];
+      }
+
+      encryptionKey = keys.aesKey;
+      hmacKey = keys.hmacKey;
+      failedAttempts = 0;
+
+      document.getElementById("loginScreen").style.display = "none";
+      document.getElementById("appScreen").style.display = "block";
+
+      renderProducts();
+    }
+
+    function validatePassword(password) {
+      const errors = [];
+      if (password.length < SECURITY_CONFIG.PASSWORD_POLICY.minLength) {
+        errors.push(`Le mot de passe doit faire au moins ${SECURITY_CONFIG.PASSWORD_POLICY.minLength} caractères`);
+      }
+      if (SECURITY_CONFIG.PASSWORD_POLICY.requireSpecialChar && !/[!@#$%^&*]/.test(password)) {
+        errors.push("Doit contenir un caractère spécial");
+      }
+      if (SECURITY_CONFIG.PASSWORD_POLICY.requireNumber && !/\d/.test(password)) {
+        errors.push("Doit contenir un chiffre");
+      }
+      if (errors.length > 0) throw new Error(errors.join("; "));
+    }
+
+    async function addProduct(e) {
+      e.preventDefault();
+      try {
+        const name = sanitizeInput(document.getElementById("productName").value.trim());
+        const quantity = parseInt(document.getElementById("productQuantity").value);
+
+        if (!name || isNaN(quantity) || quantity < 0) {
+          throw new Error("Données invalides");
+        }
+
+        products.push({
+          id: Date.now(),
+          name,
+          quantity,
+          updatedAt: new Date().toISOString()
+        });
+
+        logAction(`Produit ajouté : ${name}`);
+        filterProducts();
+        renderProducts();
+        saveToLocalStorage();
+
+      } catch (error) {
+        showNotification(error.message, true);
+      }
+    }
+
+    function renderProducts() {
+      const list = document.getElementById("productList");
+      list.innerHTML = "";
+      products.forEach(p => {
+        const li = document.createElement("li");
+        li.textContent = `${p.name} - ${p.quantity}`;
+        list.appendChild(li);
+      });
+    }
+
+    async function saveToLocalStorage() {
+      if (!encryptionKey) return;
+      const encrypted = await encrypt({ products }, encryptionKey, hmacKey);
+      localStorage.setItem("secureData", JSON.stringify(encrypted));
+    }
+
+    function logAction(action) {
+      console.log("[LOG]", action);
+    }
+
+    function init() {
+      if (localStorage.getItem("authData")) {
+        document.getElementById("loginScreen").style.display = "block";
+      } else {
+        document.getElementById("setupScreen").style.display = "block";
+      }
+    }
+
+    window.onload = () => init();
+  </script>
+</body>
+</html>
